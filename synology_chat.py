@@ -73,7 +73,9 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8086
 DEFAULT_WEBHOOK_PATH = "/synology-chat/webhook"
 DEFAULT_API_ENDPOINT = "https://127.0.0.1:5001/webapi/entry.cgi"
-MAX_MESSAGE_LENGTH = 16384  # Synology Chat max message length
+MAX_MESSAGE_LENGTH = 2000  # Synology Chat API max message length
+CHUNK_TEXT_LIMIT = MAX_MESSAGE_LENGTH - len("[part 99/99] ".encode("utf-8"))  # byte limit reserved for prefix
+CHUNK_PREFIX_TEMPLATE = "[part {i}/{total}] "
 
 
 def check_synology_chat_requirements() -> bool:
@@ -310,50 +312,36 @@ class SynologyChatAdapter(BasePlatformAdapter):
             logger.warning("[synology_chat] Cannot resolve user_id for chat_id=%s", chat_id)
             return SendResult(success=False, error=f"No user_id mapping for {chat_id}")
 
-        # Truncate if needed
-        text = content[:MAX_MESSAGE_LENGTH]
+        # Split long content into chunks and send sequentially
+        chunks = self._chunk_content(content)
+        last_result = SendResult(success=False, error="No chunk sent")
 
-        # Build the API request
-        # Try to convert user_id to int, but keep as string if it fails
-        try:
-            user_id_int = int(user_id)
-            user_ids = [user_id_int]
-        except (ValueError, TypeError):
-            # If user_id is not a valid integer, use it as-is
-            user_ids = [user_id]
-        
-        post_data = {
-            "api": "SYNO.Chat.External",
-            "method": "chatbot",
-            "version": "2",
-            "token": self._token,
-            "payload": json.dumps({
-                "text": text,
-                "user_ids": user_ids,
-            }),
-        }
+        for i, chunk in enumerate(chunks):
+            prefix = CHUNK_PREFIX_TEMPLATE.format(i=i+1, total=len(chunks)) if len(chunks) > 1 else ""
+            text = prefix + chunk
 
-        try:
-            if self._http_session:
-                async with self._http_session.post(
-                    self._api_endpoint,
-                    data=post_data,
-                    timeout=_aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status < 300:
-                        response_data = await resp.json()
-                        if response_data.get("success"):
-                            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-                        else:
-                            error_msg = response_data.get("error", "Unknown error")
-                            logger.error("[synology_chat] API error: %s", error_msg)
-                            return SendResult(success=False, error=str(error_msg))
-                    else:
-                        body = await resp.text()
-                        logger.error("[synology_chat] HTTP %d: %s", resp.status, body[:200])
-                        return SendResult(success=False, error=f"HTTP {resp.status}: {body[:200]}")
-            else:
-                async with _aiohttp.ClientSession() as session:
+            # Convert user_id
+            try:
+                user_id_int = int(user_id)
+                user_ids = [user_id_int]
+            except (ValueError, TypeError):
+                user_ids = [user_id]
+
+            post_data = {
+                "api": "SYNO.Chat.External",
+                "method": "chatbot",
+                "version": "2",
+                "token": self._token,
+                "payload": json.dumps({
+                    "text": text,
+                    "user_ids": user_ids,
+                }),
+            }
+
+            try:
+                session = self._http_session if self._http_session else _aiohttp.ClientSession()
+                close_session = not bool(self._http_session)
+                try:
                     async with session.post(
                         self._api_endpoint,
                         data=post_data,
@@ -362,19 +350,64 @@ class SynologyChatAdapter(BasePlatformAdapter):
                         if resp.status < 300:
                             response_data = await resp.json()
                             if response_data.get("success"):
-                                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                                last_result = SendResult(success=True, message_id=uuid.uuid4().hex[:12])
                             else:
                                 error_msg = response_data.get("error", "Unknown error")
-                                return SendResult(success=False, error=str(error_msg))
+                                logger.error("[synology_chat] API error (chunk %d/%d): %s", i+1, len(chunks), error_msg)
+                                last_result = SendResult(success=False, error=str(error_msg))
                         else:
                             body = await resp.text()
-                            return SendResult(success=False, error=f"HTTP {resp.status}: {body[:200]}")
+                            logger.error("[synology_chat] HTTP %d (chunk %d/%d): %s", resp.status, i+1, len(chunks), body[:200])
+                            last_result = SendResult(success=False, error=f"HTTP {resp.status}: {body[:200]}")
+                finally:
+                    if close_session:
+                        await session.close()
 
-        except asyncio.TimeoutError:
-            return SendResult(success=False, error="Timeout sending to Synology Chat")
-        except Exception as e:
-            logger.error("[synology_chat] Send failed: %s", e)
-            return SendResult(success=False, error=str(e))
+            except asyncio.TimeoutError:
+                logger.error("[synology_chat] Timeout sending chunk %d/%d", i+1, len(chunks))
+                last_result = SendResult(success=False, error="Timeout sending to Synology Chat")
+            except Exception as e:
+                logger.error("[synology_chat] Send chunk %d/%d failed: %s", i+1, len(chunks), e)
+                last_result = SendResult(success=False, error=str(e))
+
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.5)
+
+        return last_result
+
+    def _chunk_content(self, content: str) -> list:
+        """Split content into chunks that fit within MAX_MESSAGE_LENGTH (BYTE limit).
+        Uses CHUNK_TEXT_LIMIT (bytes) internally to reserve room for the prefix.
+        Splits on paragraph boundaries first, falls back to byte-aligned boundary
+        that never breaks UTF-8 multi-byte characters.
+        """
+        byte_limit = CHUNK_TEXT_LIMIT
+        encoded = content.encode("utf-8")
+        if len(encoded) <= byte_limit:
+            return [content]
+
+        chunks = []
+        for paragraph in content.split("\n"):
+            para_bytes = paragraph.encode("utf-8")
+            if len(para_bytes) <= byte_limit:
+                if chunks:
+                    merged = chunks[-1] + "\n" + paragraph
+                    if len(merged.encode("utf-8")) <= byte_limit:
+                        chunks[-1] = merged
+                        continue
+                chunks.append(paragraph)
+            else:
+                start = 0
+                while start < len(para_bytes):
+                    end = min(start + byte_limit, len(para_bytes))
+                    if end < len(para_bytes):
+                        while end > start and (para_bytes[end] & 0xC0) == 0x80:
+                            end -= 1
+                    chunk_bytes = para_bytes[start:end]
+                    chunks.append(chunk_bytes.decode("utf-8"))
+                    start = end
+
+        return chunks
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """No typing indicator for Synology Chat."""
