@@ -1,6 +1,6 @@
 
-### 这个是对hermes 0.15和0.16版本有效，如果使用0.16或以后版本建议使用另一个项目：   
-###       
+## 这个是对hermes 0.15和0.16版本有效，如果使用0.16或以后版本建议使用另一个项目：   https://github.com/d9394/hermes-synology-chat-plugin   
+--- ---       
 
 # Synology Chat Adapter for Hermes Agent
 
